@@ -17,6 +17,9 @@ let polling = false;
 let lastSuccessfulPoll = null;
 let lastPollError = null;
 let monitoringEnabled = true;
+let resumeAfter = Date.now();
+let monitoringGeneration = 0;
+let pendingSend = null;
 let controlQueue = Promise.resolve();
 let reportGuildId;
 const controlPath = path.resolve(dataDir, "monitoring.json");
@@ -101,30 +104,33 @@ function makeEmbed(tweet, author, media) {
 async function poll() {
   if (polling || !monitoringEnabled) return;
   polling = true;
+  const generation = monitoringGeneration;
   try {
     const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
     if (!channel?.isTextBased()) throw new Error("DISCORD_CHANNEL_ID is not a text channel");
 
     const seen = await loadSeen();
-    if (!monitoringEnabled) return;
+    if (!monitoringEnabled || generation !== monitoringGeneration) return;
     const result = await searchX();
     const users = new Map((result.includes?.users || []).map((u) => [u.id, u]));
     const mediaByKey = new Map((result.includes?.media || []).map((m) => [m.media_key, m]));
     const tweets = [...(result.data || [])].reverse();
 
     for (const tweet of tweets) {
-      if (!monitoringEnabled) break;
+      if (!monitoringEnabled || generation !== monitoringGeneration) break;
+      if (!(Date.parse(tweet.created_at) >= resumeAfter)) continue;
       if (seen.has(tweet.id)) continue;
       const author = users.get(tweet.author_id);
       const media = (tweet.attachments?.media_keys || []).map((key) => mediaByKey.get(key)).filter(Boolean);
       if (!author || !media.some((item) => item.type === "video" || item.type === "animated_gif")) continue;
 
       const { embed, postUrl, videoUrl } = makeEmbed(tweet, author, media);
-      await channel.send({
+      pendingSend = channel.send({
         content: videoUrl ? `Video: ${videoUrl}` : postUrl,
         embeds: [embed],
         allowedMentions: { parse: [] }
       });
+      try { await pendingSend; } finally { pendingSend = null; }
       seen.add(tweet.id);
     }
     await saveSeen(seen);
@@ -145,16 +151,25 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.reply({ content: "Only the server owner and administrators can use this command.", flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const requestedAt = interaction.createdTimestamp || Date.now();
+    const acknowledgement = interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    acknowledgement.catch(() => {});
     const operation = controlQueue.then(async () => {
       const enabled = interaction.commandName === "start";
+      monitoringEnabled = false;
+      monitoringGeneration++;
+      const nextResumeAfter = enabled ? requestedAt : resumeAfter;
+      const sending = pendingSend;
+      await acknowledgement;
       await mkdir(path.dirname(controlPath), { recursive: true });
-      await writeFile(`${controlPath}.tmp`, JSON.stringify({ enabled }));
+      await writeFile(`${controlPath}.tmp`, JSON.stringify({ enabled, resumeAfter: nextResumeAfter }));
       await rename(`${controlPath}.tmp`, controlPath);
+      if (sending) await sending.catch(() => {});
+      resumeAfter = nextResumeAfter;
       monitoringEnabled = enabled;
       await interaction.editReply(enabled
-        ? "Monitoring is running. New reports will be posted in the configured channel."
-        : "Monitoring is paused. A report already being sent may still arrive. Use /start to resume.");
+        ? "Posting started. Only X posts created from this /start onward will be posted. Posts from the pause are skipped."
+        : "Posting stopped. Use /start to resume with new X posts only; posts made during this pause will be skipped.");
       if (enabled) void poll();
     });
     controlQueue = operation.catch(() => {});
@@ -172,6 +187,10 @@ client.once("ready", async () => {
       const state = JSON.parse(await readFile(controlPath, "utf8"));
       if (typeof state.enabled !== "boolean") throw new Error("Invalid monitoring state");
       monitoringEnabled = state.enabled;
+      if (state.resumeAfter !== undefined) {
+        if (!Number.isFinite(state.resumeAfter)) throw new Error("Invalid resume timestamp");
+        resumeAfter = state.resumeAfter;
+      }
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
