@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Client, EmbedBuilder, GatewayIntentBits } from "discord.js";
+import { Client, EmbedBuilder, GatewayIntentBits, PermissionFlagsBits, MessageFlags } from "discord.js";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
@@ -16,6 +16,10 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 let polling = false;
 let lastSuccessfulPoll = null;
 let lastPollError = null;
+let monitoringEnabled = true;
+let controlQueue = Promise.resolve();
+let reportGuildId;
+const controlPath = path.resolve(dataDir, "monitoring.json");
 
 const server = createServer((request, response) => {
   if (request.url !== "/health" && request.url !== "/") {
@@ -26,6 +30,7 @@ const server = createServer((request, response) => {
   response.end(JSON.stringify({
     ok: true,
     discordReady: client.isReady(),
+    monitoringEnabled,
     lastSuccessfulPoll,
     lastPollError
   }));
@@ -94,19 +99,21 @@ function makeEmbed(tweet, author, media) {
 }
 
 async function poll() {
-  if (polling) return;
+  if (polling || !monitoringEnabled) return;
   polling = true;
   try {
     const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
     if (!channel?.isTextBased()) throw new Error("DISCORD_CHANNEL_ID is not a text channel");
 
     const seen = await loadSeen();
+    if (!monitoringEnabled) return;
     const result = await searchX();
     const users = new Map((result.includes?.users || []).map((u) => [u.id, u]));
     const mediaByKey = new Map((result.includes?.media || []).map((m) => [m.media_key, m]));
     const tweets = [...(result.data || [])].reverse();
 
     for (const tweet of tweets) {
+      if (!monitoringEnabled) break;
       if (seen.has(tweet.id)) continue;
       const author = users.get(tweet.author_id);
       const media = (tweet.attachments?.media_keys || []).map((key) => mediaByKey.get(key)).filter(Boolean);
@@ -131,10 +138,56 @@ async function poll() {
   }
 }
 
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand() || !["start", "stop"].includes(interaction.commandName)) return;
+  try {
+    if (interaction.guildId !== reportGuildId || !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: "Only the server owner and administrators can use this command.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const operation = controlQueue.then(async () => {
+      const enabled = interaction.commandName === "start";
+      await mkdir(path.dirname(controlPath), { recursive: true });
+      await writeFile(`${controlPath}.tmp`, JSON.stringify({ enabled }));
+      await rename(`${controlPath}.tmp`, controlPath);
+      monitoringEnabled = enabled;
+      await interaction.editReply(enabled
+        ? "Monitoring is running. New reports will be posted in the configured channel."
+        : "Monitoring is paused. A report already being sent may still arrive. Use /start to resume.");
+      if (enabled) void poll();
+    });
+    controlQueue = operation.catch(() => {});
+    await operation;
+  } catch (error) {
+    console.error("Monitoring command failed:", error.message);
+    const content = "Could not complete the command. Please try again.";
+    await (interaction.deferred ? interaction.editReply({ content }) : interaction.reply({ content, flags: MessageFlags.Ephemeral })).catch(() => {});
+  }
+});
+
 client.once("ready", async () => {
+  try {
+    try {
+      const state = JSON.parse(await readFile(controlPath, "utf8"));
+      if (typeof state.enabled !== "boolean") throw new Error("Invalid monitoring state");
+      monitoringEnabled = state.enabled;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
+    if (!channel?.guild) throw new Error("The report channel must belong to a server");
+    reportGuildId = channel.guild.id;
+    for (const [name, description] of [["start", "Resume report monitoring"], ["stop", "Pause report monitoring"]]) {
+      await channel.guild.commands.create({ name, description, defaultMemberPermissions: PermissionFlagsBits.Administrator });
+    }
   console.log(`Logged in as ${client.user.tag}; polling every ${pollMs / 1000}s`);
   await poll();
   setInterval(poll, pollMs);
+  } catch (error) {
+    console.error("Bot startup failed:", error.message);
+    process.exit(1);
+  }
 });
 
 client.login(process.env.DISCORD_TOKEN);
